@@ -1,0 +1,57 @@
+#cloud-config
+
+package_update: true
+package_upgrade: true
+
+packages:
+  - ca-certificates
+  - curl
+  - gnupg
+
+write_files:
+  - path: /etc/systemd/system/kafka.service
+    owner: root:root
+    permissions: "0644"
+    content: |
+      [Unit]
+      Description=Apache Kafka Broker (Docker)
+      After=docker.service
+      Requires=docker.service
+
+      [Service]
+      Type=simple
+      ExecStartPre=-/usr/bin/docker stop kafka
+      ExecStartPre=-/usr/bin/docker rm kafka
+      ExecStart=/usr/bin/docker run --name kafka \
+        -p 9092:9092 \
+        -e KAFKA_NODE_ID=1 \
+        -e KAFKA_PROCESS_ROLES=broker,controller \
+        -e KAFKA_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093 \
+        -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://%H:9092 \
+        -e KAFKA_CONTROLLER_LISTENER_NAMES=CONTROLLER \
+        -e KAFKA_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT \
+        -e KAFKA_CONTROLLER_QUORUM_VOTERS=1@localhost:9093 \
+        -e KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR=1 \
+        -e KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR=1 \
+        -e KAFKA_TRANSACTION_STATE_LOG_MIN_ISR=1 \
+        -e KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS=0 \
+        apache/kafka:3.7.0
+      ExecStop=/usr/bin/docker stop kafka
+      Restart=on-failure
+      RestartSec=5
+
+      [Install]
+      WantedBy=multi-user.target
+
+runcmd:
+  - |
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" \
+      > /etc/apt/sources.list.d/docker.list
+    apt-get update -y
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+    systemctl enable --now docker
+
+  - systemctl daemon-reload
+  - systemctl enable --now kafka
