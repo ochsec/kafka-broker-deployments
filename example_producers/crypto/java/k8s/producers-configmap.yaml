@@ -1,0 +1,29 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: producers-config
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+data:
+  producers.json: |
+    [
+      {
+        "exchange": "coinbase",
+        "symbol": "BTC-USD",
+        "topic": "crypto-quotes",
+        "secretRef": "kafka-broker-secret"
+      },
+      {
+        "exchange": "kraken",
+        "symbol": "BTC/USD",
+        "topic": "crypto-quotes",
+        "secretRef": "kafka-broker-secret"
+      },
+      {
+        "exchange": "okx",
+        "symbol": "BTC-USDC",
+        "topic": "crypto-quotes",
+        "secretRef": "kafka-broker-secret"
+      }
+    ]

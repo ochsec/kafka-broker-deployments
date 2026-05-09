@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: producer-controller
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: producer-controller
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+rules:
+  # Pod CRUD for the controller to spawn and check producer pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["create", "get", "list", "delete"]
+  # Secrets read access to verify secretRef exists and for debugging
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: producer-controller
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: producer-controller
+subjects:
+  - kind: ServiceAccount
+    name: producer-controller
+    namespace: crypto-producers

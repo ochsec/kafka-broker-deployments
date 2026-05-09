@@ -1,0 +1,259 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: controller-script
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+data:
+  controller.py: |
+    #!/usr/bin/env python3
+    """
+    Kubernetes controller that reads a producers ConfigMap and creates/syncs Pod resources.
+    Uses the in-cluster Kubernetes API (no kubectl binary needed).
+    
+    Idempotent add-only strategy: Only creates missing Pods, does not delete or modify existing ones.
+    """
+    
+    import json
+    import os
+    import sys
+    import ssl
+    import base64
+    import urllib.request
+    import urllib.error
+    from pathlib import Path
+    
+    
+    # In-cluster Kubernetes API configuration
+    KUBERNETES_SERVICE_HOST = os.getenv("KUBERNETES_SERVICE_HOST", "kubernetes.default.svc")
+    KUBERNETES_SERVICE_PORT = os.getenv("KUBERNETES_SERVICE_PORT", "443")
+    NAMESPACE = "crypto-producers"
+    API_BASE = f"https://{KUBERNETES_SERVICE_HOST}:{KUBERNETES_SERVICE_PORT}/api/v1"
+    
+    # In-cluster authentication
+    SA_TOKEN_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+    SA_CA_PATH = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+    
+    # Image configuration
+    PRODUCER_IMAGE = "ghcr.io/replmade/crypto-quote-producer:latest"
+    
+    
+    def load_sa_token():
+        """Load the ServiceAccount token from the mounted volume."""
+        try:
+            with open(SA_TOKEN_PATH, "r") as f:
+                return f.read().strip()
+        except Exception as e:
+            print(f"ERROR: Failed to load ServiceAccount token: {e}", file=sys.stderr)
+            sys.exit(1)
+    
+    
+    def create_ssl_context():
+        """Create an SSL context that trusts the in-cluster CA."""
+        ctx = ssl.create_default_context()
+        try:
+            ctx.load_verify_locations(SA_CA_PATH)
+        except Exception as e:
+            print(f"WARNING: Could not load CA cert from {SA_CA_PATH}: {e}", file=sys.stderr)
+            # In some environments (e.g., testing), the CA may not be available
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+        return ctx
+    
+    
+    def api_request(method, path, token, data=None):
+        """
+        Make an authenticated HTTP request to the Kubernetes API.
+        Returns (status_code, response_body).
+        """
+        url = f"{API_BASE}{path}"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+        }
+        
+        req = urllib.request.Request(url, method=method, headers=headers)
+        if data:
+            req.data = json.dumps(data).encode("utf-8")
+        
+        ssl_context = create_ssl_context()
+        
+        try:
+            with urllib.request.urlopen(req, context=ssl_context) as response:
+                body = response.read().decode("utf-8")
+                return response.status, body
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8") if e.fp else ""
+            return e.code, body
+        except Exception as e:
+            print(f"ERROR: API request failed: {e}", file=sys.stderr)
+            raise
+    
+    
+    def normalize_pod_name(exchange, symbol):
+        """
+        Normalize exchange and symbol into a valid Kubernetes Pod name.
+        Pod names must be lowercase alphanumeric or hyphens.
+        """
+        # Replace slashes and spaces with hyphens, lowercase
+        normalized = f"{exchange}-{symbol}".replace("/", "-").replace("_", "-").lower()
+        # Remove any remaining invalid characters
+        normalized = "".join(c if c.isalnum() or c == "-" else "" for c in normalized)
+        # Prefix with 'crypto-producer-'
+        pod_name = f"crypto-producer-{normalized}"
+        # Ensure it doesn't exceed 253 chars (Kubernetes limit)
+        return pod_name[:253]
+    
+    
+    def pod_exists(token, pod_name):
+        """Check if a Pod already exists."""
+        try:
+            status, _ = api_request("GET", f"/namespaces/{NAMESPACE}/pods/{pod_name}", token)
+            return status == 200
+        except Exception as e:
+            print(f"WARNING: Failed to check if pod {pod_name} exists: {e}", file=sys.stderr)
+            # Assume it doesn't exist to avoid duplicate creation
+            return False
+    
+    
+    def create_producer_pod(token, exchange, symbol, topic, secret_ref):
+        """
+        Create a new producer Pod using the Kubernetes API.
+        Pod inherits KAFKA_BOOTSTRAP_SERVERS from a Secret via secretKeyRef.
+        """
+        pod_name = normalize_pod_name(exchange, symbol)
+        
+        pod_spec = {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {
+                "name": pod_name,
+                "namespace": NAMESPACE,
+                "labels": {
+                    "app": "crypto-producer",
+                    "exchange": exchange,
+                    "symbol": symbol,
+                },
+            },
+            "spec": {
+                "serviceAccountName": "producer-controller",  # Reuse SA for consistency
+                "restartPolicy": "Always",
+                "containers": [
+                    {
+                        "name": "producer",
+                        "image": PRODUCER_IMAGE,
+                        "imagePullPolicy": "Always",
+                        "env": [
+                            {
+                                "name": "EXCHANGE",
+                                "value": exchange,
+                            },
+                            {
+                                "name": "SYMBOL",
+                                "value": symbol,
+                            },
+                            {
+                                "name": "KAFKA_TOPIC",
+                                "value": topic,
+                            },
+                            {
+                                "name": "KAFKA_BOOTSTRAP_SERVERS",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": secret_ref,
+                                        "key": "KAFKA_BOOTSTRAP_SERVERS",
+                                    }
+                                },
+                            },
+                        ],
+                        "resources": {
+                            "requests": {
+                                "memory": "256Mi",
+                                "cpu": "100m",
+                            },
+                            "limits": {
+                                "memory": "512Mi",
+                                "cpu": "500m",
+                            },
+                        },
+                    }
+                ],
+            },
+        }
+        
+        try:
+            status, response = api_request(
+                "POST",
+                f"/namespaces/{NAMESPACE}/pods",
+                token,
+                data=pod_spec,
+            )
+            if status in (200, 201):
+                print(f"✓ Created pod: {pod_name}")
+                return True
+            else:
+                print(f"✗ Failed to create pod {pod_name}: status={status}, response={response[:200]}", file=sys.stderr)
+                return False
+        except Exception as e:
+            print(f"✗ Exception creating pod {pod_name}: {e}", file=sys.stderr)
+            return False
+    
+    
+    def main():
+        """Main controller logic."""
+        # Load configuration
+        try:
+            with open("/config/producers.json", "r") as f:
+                producers = json.load(f)
+        except Exception as e:
+            print(f"ERROR: Failed to load /config/producers.json: {e}", file=sys.stderr)
+            sys.exit(1)
+        
+        if not producers:
+            print("WARNING: No producers configured in producers.json")
+            return
+        
+        # Load ServiceAccount token
+        token = load_sa_token()
+        
+        print(f"Syncing {len(producers)} producer(s) to Kubernetes...")
+        print()
+        
+        created_count = 0
+        skipped_count = 0
+        failed_count = 0
+        
+        for producer in producers:
+            exchange = producer.get("exchange")
+            symbol = producer.get("symbol")
+            topic = producer.get("topic")
+            secret_ref = producer.get("secretRef", "kafka-broker-secret")
+            
+            if not all([exchange, symbol, topic]):
+                print(f"✗ Skipping invalid producer entry: {producer}", file=sys.stderr)
+                failed_count += 1
+                continue
+            
+            pod_name = normalize_pod_name(exchange, symbol)
+            
+            # Check if pod already exists
+            if pod_exists(token, pod_name):
+                print(f"- Pod already exists: {pod_name}")
+                skipped_count += 1
+            else:
+                # Create the pod
+                if create_producer_pod(token, exchange, symbol, topic, secret_ref):
+                    created_count += 1
+                else:
+                    failed_count += 1
+        
+        print()
+        print(f"Summary: {created_count} created, {skipped_count} skipped, {failed_count} failed")
+        
+        if failed_count > 0:
+            sys.exit(1)
+    
+    
+    if __name__ == "__main__":
+        main()

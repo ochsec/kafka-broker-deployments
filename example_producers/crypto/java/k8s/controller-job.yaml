@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: producer-controller
+  namespace: crypto-producers
+  labels:
+    app: crypto-quote-producer
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 600  # Clean up completed job after 10 minutes
+  template:
+    metadata:
+      labels:
+        app: crypto-quote-producer
+        component: controller
+    spec:
+      serviceAccountName: producer-controller
+      restartPolicy: Never
+      containers:
+        - name: controller
+          image: python:3.12-slim
+          imagePullPolicy: IfNotPresent
+          command:
+            - python
+            - /config/controller.py
+          volumeMounts:
+            - name: controller-script
+              mountPath: /config
+              readOnly: true
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "50m"
+            limits:
+              memory: "256Mi"
+              cpu: "200m"
+      volumes:
+        - name: controller-script
+          configMap:
+            name: controller-script
+            defaultMode: 0755
